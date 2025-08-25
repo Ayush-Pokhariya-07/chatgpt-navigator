@@ -1,0 +1,30 @@
+#chatgpt-navigator {
+    position: fixed;
+    top: 50px;
+    right: 10px;
+    width: 250px;
+    max-height: 80vh;
+    overflow-y: auto;
+    background: white;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    padding: 10px;
+    z-index: 9999;
+    font-family: Arial, sans-serif;
+}
+
+#chatgpt-navigator h2 {
+    font-size: 16px;
+    margin: 0 0 10px 0;
+    text-align: center;
+}
+
+.nav-item {
+    padding: 8px;
+    cursor: pointer;
+    border-bottom: 1px solid #eee;
+}
+
+.nav-item:hover {
+    background: #f0f0f0;
+}

@@ -1,0 +1,17 @@
+{
+    "manifest_version": 3,
+    "name": "ChatGPT Navigator",
+    "version": "1.0",
+    "description": "Quickly jump to any question in your ChatGPT conversation",
+    "permissions": ["activeTab", "scripting"],
+    "content_scripts": [
+        {
+            "matches": ["https://chat.openai.com/*", "https://chatgpt.com/*"],
+            "js": ["content.js"],
+            "css": ["style.css"]
+        }
+    ],
+    "icons": {
+        "128": "icon.png"
+    }
+}
