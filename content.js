@@ -40,3 +40,22 @@ setTimeout(() => {
     let questions = scanChat();
     if (questions.length) createSidebar(questions);
 }, 2000);
+
+function observeChat() {
+    const chatContainer = document.querySelector("main"); // Chat area root
+
+    if (!chatContainer) return;
+
+    const observer = new MutationObserver(() => {
+        let sidebar = document.getElementById("chatgpt-navigator");
+        if (sidebar) sidebar.remove(); // remove old one
+        let questions = scanChat();
+        if (questions.length) createSidebar(questions);
+    });
+
+    observer.observe(chatContainer, { childList: true, subtree: true });
+}
+
+setTimeout(() => {
+    observeChat(); // start observing
+}, 2000);
