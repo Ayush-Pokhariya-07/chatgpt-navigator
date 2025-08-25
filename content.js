@@ -17,7 +17,10 @@ function createSidebar(questions) {
 }
 
 function scanChat() {
-    let userMessages = document.querySelectorAll('div[class*="user"]');
+    // Grab only user messages (your questions)
+    let userMessages = document.querySelectorAll(
+        '[data-testid="user-message"]'
+    );
     let questions = [];
 
     userMessages.forEach((msg) => {
