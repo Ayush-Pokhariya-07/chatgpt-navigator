@@ -2,14 +2,58 @@
 console.log(
     "ChatGPT Navigator — content script loaded (toggle + improved styling)"
 );
-
 const LOG_PREFIX = "🔎 ChatGPT Navigator:";
 
-// Global set to track which messages have already been added to the sidebar
-const seenKeys = new Set();
+/*
+ Strategy:
+ - Identify conversation by URL pathname (if available): use as convKey.
+ - Compute a signature for each user message:
+    1) Prefer existing stable attribute (if present)
+    2) Otherwise compute a lightweight hash of the trimmed text
+ - Maintain a Map convSeen: convKey -> Set(signatures)
+ - When opening sidebar: do a full rebuild for current conv (clear DOM, show unique messages in order)
+ - When observer sees new nodes: append only messages whose signature is not in convSeen[convKey]
+*/
 
-// Helper: read all candidate user messages and return normalized items
-function getAllMessages() {
+// Per-conversation seen signatures
+const convSeen = new Map();
+
+// simple string hash -> hex (djb2 variant, stable and fast)
+function strHashHex(str) {
+    let h = 5381;
+    for (let i = 0; i < str.length; i++) {
+        h = (h * 33) ^ str.charCodeAt(i);
+    }
+    // convert to unsigned and hex
+    return (h >>> 0).toString(16);
+}
+
+function getConversationKey() {
+    // Try to extract a stable chat id from the URL path (/chat/<id>)
+    try {
+        const p = location.pathname || "";
+        const parts = p.split("/").filter(Boolean);
+        // if URL path contains an id-like segment after "chat", use that
+        const chatIdx = parts.indexOf("chat");
+        if (chatIdx >= 0 && parts.length > chatIdx + 1) {
+            return parts[chatIdx + 1];
+        }
+        // otherwise fallback to the full pathname
+        return p || location.href;
+    } catch (e) {
+        return location.href;
+    }
+}
+
+function ensureConvSet(key) {
+    if (!convSeen.has(key)) convSeen.set(key, new Set());
+    return convSeen.get(key);
+}
+
+// Read candidate user messages from DOM and produce normalized items.
+// Each item: { signature, id, text, element }
+function getAllMessagesForCurrentConv() {
+    // Select candidate nodes (user messages)
     let userMessages = Array.from(
         document.querySelectorAll('[data-testid="user-message"]')
     );
@@ -24,37 +68,107 @@ function getAllMessages() {
         );
     }
 
-    // Normalize and ensure stable IDs
+    // Normalize into ordered list
+    const convKey = getConversationKey();
     return userMessages
-        .map((msg, index) => {
-            if (!msg.id) {
-                // create a stable-ish id — timestamp + index minimizes collisions
-                msg.id = "cgpn-question-" + Date.now() + "-" + index;
-            }
+        .map((msg, idx) => {
+            // raw text trimmed
             const raw = (msg.innerText || "").trim();
+            // try to find any existing attribute that could be stable; else compute signature from text
+            let signature =
+                msg.getAttribute("data-nav-signature") ||
+                msg.getAttribute("data-id") ||
+                msg.getAttribute("id");
+            if (!signature) {
+                // compute signature from text — prevents streaming duplicates (same text -> same signature)
+                // we include a short prefix of the text to keep it deterministic
+                const short = raw.slice(0, 250); // cap length to avoid huge hashes
+                signature = "s_" + strHashHex(short);
+                // store it on the element so re-renders that keep the same node will preserve it
+                try {
+                    msg.setAttribute("data-nav-signature", signature);
+                } catch (e) {}
+            }
+
+            // Ensure element has an id we can scroll to
+            if (!msg.id) {
+                try {
+                    msg.id = `cgpn-${convKey}-${signature}`;
+                } catch (e) {}
+            }
+
             return {
+                signature,
                 id: msg.id,
-                text: raw.length > 60 ? raw.slice(0, 60) + "…" : raw,
-                element: msg,
+                text: raw.length > 80 ? raw.slice(0, 80) + "…" : raw,
                 rawText: raw,
+                element: msg,
             };
         })
-        .filter((item) => item.rawText); // filter out empty texts just in case
+        .filter((item) => item.rawText && item.signature);
 }
 
-// Return only messages that haven't been seen yet
-function getNewMessages() {
-    const all = getAllMessages();
-    const newOnes = all.filter((m) => !seenKeys.has(m.id));
-    return newOnes;
+// Append only new messages (by signature) for the current conversation
+function appendNewMessagesForCurrentConv() {
+    const convKey = getConversationKey();
+    const seen = ensureConvSet(convKey);
+    const all = getAllMessagesForCurrentConv();
+    const newItems = [];
+    for (const it of all) {
+        if (!seen.has(it.signature)) {
+            newItems.push(it);
+            seen.add(it.signature);
+        }
+    }
+
+    if (newItems.length === 0) return 0;
+
+    // If sidebar visible, append to DOM; otherwise just mark seen.
+    const sidebar = document.getElementById("chatgpt-navigator");
+    if (sidebar && sidebar.style.display === "block") {
+        updateSidebar(newItems, { append: true });
+        console.log(
+            `${LOG_PREFIX} appended ${newItems.length} new item(s) for conv ${convKey}`
+        );
+    } else {
+        console.log(
+            `${LOG_PREFIX} detected ${newItems.length} new message(s) for conv ${convKey} (sidebar hidden).`
+        );
+    }
+    return newItems.length;
 }
 
-// Full scan (used when opening or initial build) — marks all as seen
-function scanAndMarkAll() {
-    const all = getAllMessages();
-    all.forEach((m) => seenKeys.add(m.id));
-    return all;
+// Full ordered unique list for current conversation (used when opening)
+function getUniqueOrderedForCurrentConv() {
+    const convKey = getConversationKey();
+    const seen = ensureConvSet(convKey);
+    const all = getAllMessagesForCurrentConv();
+    const uniq = [];
+    for (const it of all) {
+        if (!seen.has(it.signature)) {
+            // not seen before, add and mark
+            uniq.push(it);
+            seen.add(it.signature);
+        } else {
+            // already seen — but might not be in order for first rebuild; ensure we still include
+            // we also want to include earlier seen items in the full rebuild so the user sees all messages.
+            // Therefore, we will collect all unique signatures in-order:
+            // We'll handle by building an ordered map below.
+        }
+    }
+
+    // To produce a full ordered unique list (including previously seen signatures) we do:
+    const orderedMap = new Map();
+    for (const it of getAllMessagesForCurrentConv()) {
+        if (!orderedMap.has(it.signature)) orderedMap.set(it.signature, it);
+    }
+    // mark all as seen
+    for (const key of orderedMap.keys()) ensureConvSet(convKey).add(key);
+
+    return Array.from(orderedMap.values());
 }
+
+/* ---------- UI creation / update ---------- */
 
 function ensureToggleButton() {
     let btn = document.getElementById("cgpn-toggle");
@@ -117,9 +231,7 @@ function ensureSidebar() {
 function updateSidebar(items, options = { append: false }) {
     const sidebar = ensureSidebar();
     const list = sidebar.querySelector("#chatgpt-navigator-list");
-    if (!options.append) {
-        list.innerHTML = "";
-    }
+    if (!options.append) list.innerHTML = "";
 
     if ((!items || items.length === 0) && !options.append) {
         const empty = document.createElement("div");
@@ -129,26 +241,25 @@ function updateSidebar(items, options = { append: false }) {
         return;
     }
 
-    // Append each item
-    items.forEach((q, i) => {
-        // If item already exists in DOM (by id), skip appending
-        if (document.getElementById("cgpn-item-" + q.id)) return;
+    items.forEach((q) => {
+        // Avoid duplicate sidebar items by checking an item id
+        const itemDomId = "cgpn-item-" + q.signature;
+        if (document.getElementById(itemDomId)) return;
 
         const item = document.createElement("div");
         item.className = "nav-item";
-        item.id = "cgpn-item-" + q.id; // DOM id for sidebar item (prevents duplicates)
+        item.id = itemDomId;
         item.setAttribute("role", "listitem");
         item.textContent = q.text || `Question`;
         item.addEventListener("click", (ev) => {
             ev.stopPropagation();
             try {
-                const target = document.getElementById(q.id);
+                const target = document.getElementById(q.id) || q.element;
                 if (target) {
                     target.scrollIntoView({
                         behavior: "smooth",
                         block: "center",
                     });
-                    // highlight target briefly
                     const prev = target.style.boxShadow;
                     target.style.transition = "box-shadow 0.3s";
                     target.style.boxShadow = "0 0 0 4px rgba(255,200,0,0.6)";
@@ -158,7 +269,7 @@ function updateSidebar(items, options = { append: false }) {
                     );
                 } else {
                     console.warn(
-                        `${LOG_PREFIX} target element not found for id ${q.id}`
+                        `${LOG_PREFIX} target element not found for signature ${q.signature}`
                     );
                 }
             } catch (err) {
@@ -272,7 +383,6 @@ function addStyles() {
       border-top: 1px solid rgba(15,23,36,0.03);
     }
 
-    /* small adjustments for narrow screens */
     @media (max-width: 900px) {
       #chatgpt-navigator { width: 86vw; right: 7vw; }
       #cgpn-toggle { right: 6px; top: 8px; }
@@ -289,10 +399,10 @@ function toggleSidebar(show) {
         sidebar.style.display = "block";
         btn.setAttribute("aria-expanded", "true");
         // Full rebuild (show everything) when opening
-        const all = scanAndMarkAll();
-        updateSidebar(all, { append: false });
+        const allOrdered = getUniqueOrderedForCurrentConv();
+        updateSidebar(allOrdered, { append: false });
         console.log(
-            `${LOG_PREFIX} opened sidebar with ${all.length} items (full rebuild).`
+            `${LOG_PREFIX} opened sidebar with ${allOrdered.length} items (full rebuild).`
         );
     } else {
         sidebar.style.display = "none";
@@ -300,27 +410,15 @@ function toggleSidebar(show) {
     }
 }
 
-function rebuildSidebar() {
-    try {
-        addStyles();
-        // Full rebuild but keep it collapsed if it's not open — this helps keep the list consistent
-        const all = scanAndMarkAll();
-        // Only update the DOM list if the sidebar is currently visible — prevents visible flicker
-        const sidebar = document.getElementById("chatgpt-navigator");
-        if (sidebar && sidebar.style.display === "block") {
-            updateSidebar(all, { append: false });
-        } else {
-            // if hidden, still mark seen (done above) — but do not touch DOM
-            console.log(
-                `${LOG_PREFIX} scanned ${all.length} messages (sidebar hidden).`
-            );
-        }
-        console.log(
-            `${LOG_PREFIX} rebuildSidebar completed; total known items: ${seenKeys.size}`
-        );
-    } catch (e) {
-        console.error(`${LOG_PREFIX} rebuild error`, e);
-    }
+// initial silent scan for current conversation: mark as seen (so sidebar doesn't show older messages until open)
+function initialSilentMark() {
+    const convKey = getConversationKey();
+    const seen = ensureConvSet(convKey);
+    const all = getAllMessagesForCurrentConv();
+    all.forEach((m) => seen.add(m.signature));
+    console.log(
+        `${LOG_PREFIX} initial silent scan for conv ${convKey}: ${all.length} messages marked.`
+    );
 }
 
 function setupObserverAndHandlers() {
@@ -342,13 +440,11 @@ function setupObserverAndHandlers() {
                 const btn = document.getElementById("cgpn-toggle");
                 const target = ev.target;
                 if (!sidebar || !btn) return;
-                // If click is inside sidebar or on the toggle button, ignore
                 if (
                     target.closest("#chatgpt-navigator") ||
                     target.closest("#cgpn-toggle")
                 )
                     return;
-                // otherwise, close
                 toggleSidebar(false);
             });
 
@@ -357,37 +453,15 @@ function setupObserverAndHandlers() {
                 if (ev.key === "Escape") toggleSidebar(false);
             });
 
-            // initial silent scan (mark existing messages) — don't show UI yet
-            const initial = getAllMessages();
-            initial.forEach((m) => seenKeys.add(m.id));
-            console.log(
-                `${LOG_PREFIX} initial silent scan: ${initial.length} messages marked.`
-            );
+            // initial silent mark for current conversation
+            initialSilentMark();
 
-            // observe changes to the chat and refresh silently (append only new ones)
+            // Observe chat changes and append only new unique messages (debounced)
             const observer = new MutationObserver(() => {
-                // debounce
                 if (observer._timeout) clearTimeout(observer._timeout);
                 observer._timeout = setTimeout(() => {
                     try {
-                        const newMessages = getNewMessages();
-                        if (newMessages && newMessages.length) {
-                            // Add them to seen set and append to sidebar if visible
-                            newMessages.forEach((m) => seenKeys.add(m.id));
-                            const sidebar =
-                                document.getElementById("chatgpt-navigator");
-                            if (sidebar && sidebar.style.display === "block") {
-                                updateSidebar(newMessages, { append: true });
-                                console.log(
-                                    `${LOG_PREFIX} appended ${newMessages.length} new items.`
-                                );
-                            } else {
-                                // Not visible — just update seenKeys and log
-                                console.log(
-                                    `${LOG_PREFIX} detected ${newMessages.length} new message(s) (sidebar hidden).`
-                                );
-                            }
-                        }
+                        appendNewMessagesForCurrentConv();
                     } catch (err) {
                         console.error(
                             `${LOG_PREFIX} observer handler error`,
@@ -397,6 +471,28 @@ function setupObserverAndHandlers() {
                 }, 250);
             });
             observer.observe(chatRoot, { childList: true, subtree: true });
+
+            // Detect conversation (URL) changes: if user switches chat, reset any UI and ensure marking for new conv
+            let lastConv = getConversationKey();
+            setInterval(() => {
+                const cur = getConversationKey();
+                if (cur !== lastConv) {
+                    console.log(
+                        `${LOG_PREFIX} conversation changed from ${lastConv} -> ${cur}`
+                    );
+                    lastConv = cur;
+                    // ensure set exists and mark existing messages as seen (silent)
+                    initialSilentMark();
+                    // clear sidebar DOM (so opening will rebuild for the new chat)
+                    const sidebar =
+                        document.getElementById("chatgpt-navigator");
+                    if (sidebar) {
+                        sidebar.querySelector(
+                            "#chatgpt-navigator-list"
+                        ).innerHTML = "";
+                    }
+                }
+            }, 800);
         } else if (attempts > 40) {
             clearInterval(interval);
             console.warn(`${LOG_PREFIX} couldn't find chat root after ~10s.`);
