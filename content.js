@@ -5,7 +5,11 @@ console.log(
 
 const LOG_PREFIX = "🔎 ChatGPT Navigator:";
 
-function scanChat() {
+// Global set to track which messages have already been added to the sidebar
+const seenKeys = new Set();
+
+// Helper: read all candidate user messages and return normalized items
+function getAllMessages() {
     let userMessages = Array.from(
         document.querySelectorAll('[data-testid="user-message"]')
     );
@@ -15,25 +19,41 @@ function scanChat() {
                 'article, [role="listitem"], [role="article"], div[class*="message"], .chat-message'
             )
         );
-        console.log(
-            `${LOG_PREFIX} primary selector found 0. fallback candidate count: ${fallbacks.length}`
-        );
         userMessages = fallbacks.filter(
             (el) => (el.innerText || "").trim().length > 0
         );
-    } else {
-        console.log(
-            `${LOG_PREFIX} found ${userMessages.length} user-message nodes (primary).`
-        );
     }
 
-    return userMessages.map((msg) => {
-        const raw = (msg.innerText || "").trim();
-        return {
-            text: raw.length > 60 ? raw.slice(0, 60) + "…" : raw,
-            element: msg,
-        };
-    });
+    // Normalize and ensure stable IDs
+    return userMessages
+        .map((msg, index) => {
+            if (!msg.id) {
+                // create a stable-ish id — timestamp + index minimizes collisions
+                msg.id = "cgpn-question-" + Date.now() + "-" + index;
+            }
+            const raw = (msg.innerText || "").trim();
+            return {
+                id: msg.id,
+                text: raw.length > 60 ? raw.slice(0, 60) + "…" : raw,
+                element: msg,
+                rawText: raw,
+            };
+        })
+        .filter((item) => item.rawText); // filter out empty texts just in case
+}
+
+// Return only messages that haven't been seen yet
+function getNewMessages() {
+    const all = getAllMessages();
+    const newOnes = all.filter((m) => !seenKeys.has(m.id));
+    return newOnes;
+}
+
+// Full scan (used when opening or initial build) — marks all as seen
+function scanAndMarkAll() {
+    const all = getAllMessages();
+    all.forEach((m) => seenKeys.add(m.id));
+    return all;
 }
 
 function ensureToggleButton() {
@@ -89,12 +109,19 @@ function ensureSidebar() {
     return sidebar;
 }
 
-function updateSidebar(questions) {
+/**
+ * updateSidebar(items, { append: boolean })
+ * - if append === true -> append items to existing list (used for incremental updates)
+ * - if append === false -> clear and populate full list (used for full rebuild)
+ */
+function updateSidebar(items, options = { append: false }) {
     const sidebar = ensureSidebar();
     const list = sidebar.querySelector("#chatgpt-navigator-list");
-    list.innerHTML = "";
+    if (!options.append) {
+        list.innerHTML = "";
+    }
 
-    if (questions.length === 0) {
+    if ((!items || items.length === 0) && !options.append) {
         const empty = document.createElement("div");
         empty.className = "nav-empty";
         empty.textContent = "No user messages found yet.";
@@ -102,23 +129,38 @@ function updateSidebar(questions) {
         return;
     }
 
-    questions.forEach((q, i) => {
+    // Append each item
+    items.forEach((q, i) => {
+        // If item already exists in DOM (by id), skip appending
+        if (document.getElementById("cgpn-item-" + q.id)) return;
+
         const item = document.createElement("div");
         item.className = "nav-item";
+        item.id = "cgpn-item-" + q.id; // DOM id for sidebar item (prevents duplicates)
         item.setAttribute("role", "listitem");
-        item.textContent = q.text || `Question ${i + 1}`;
+        item.textContent = q.text || `Question`;
         item.addEventListener("click", (ev) => {
             ev.stopPropagation();
             try {
-                q.element.scrollIntoView({
-                    behavior: "smooth",
-                    block: "center",
-                });
-                // highlight target briefly
-                const prev = q.element.style.boxShadow;
-                q.element.style.transition = "box-shadow 0.3s";
-                q.element.style.boxShadow = "0 0 0 4px rgba(255,200,0,0.6)";
-                setTimeout(() => (q.element.style.boxShadow = prev || ""), 900);
+                const target = document.getElementById(q.id);
+                if (target) {
+                    target.scrollIntoView({
+                        behavior: "smooth",
+                        block: "center",
+                    });
+                    // highlight target briefly
+                    const prev = target.style.boxShadow;
+                    target.style.transition = "box-shadow 0.3s";
+                    target.style.boxShadow = "0 0 0 4px rgba(255,200,0,0.6)";
+                    setTimeout(
+                        () => (target.style.boxShadow = prev || ""),
+                        900
+                    );
+                } else {
+                    console.warn(
+                        `${LOG_PREFIX} target element not found for id ${q.id}`
+                    );
+                }
             } catch (err) {
                 console.error(`${LOG_PREFIX} scroll error`, err);
             }
@@ -211,6 +253,7 @@ function addStyles() {
       font-size:13px;
       line-height:1.3;
       box-sizing: border-box;
+      overflow-wrap: break-word;
     }
     .nav-item:hover, .nav-item-hover {
       background: rgba(2,6,23,0.06);
@@ -245,7 +288,12 @@ function toggleSidebar(show) {
     if (show) {
         sidebar.style.display = "block";
         btn.setAttribute("aria-expanded", "true");
-        rebuildSidebar(); // refresh content when opening
+        // Full rebuild (show everything) when opening
+        const all = scanAndMarkAll();
+        updateSidebar(all, { append: false });
+        console.log(
+            `${LOG_PREFIX} opened sidebar with ${all.length} items (full rebuild).`
+        );
     } else {
         sidebar.style.display = "none";
         btn.setAttribute("aria-expanded", "false");
@@ -255,9 +303,21 @@ function toggleSidebar(show) {
 function rebuildSidebar() {
     try {
         addStyles();
-        const qs = scanChat();
-        updateSidebar(qs);
-        console.log(`${LOG_PREFIX} rebuilt sidebar with ${qs.length} items.`);
+        // Full rebuild but keep it collapsed if it's not open — this helps keep the list consistent
+        const all = scanAndMarkAll();
+        // Only update the DOM list if the sidebar is currently visible — prevents visible flicker
+        const sidebar = document.getElementById("chatgpt-navigator");
+        if (sidebar && sidebar.style.display === "block") {
+            updateSidebar(all, { append: false });
+        } else {
+            // if hidden, still mark seen (done above) — but do not touch DOM
+            console.log(
+                `${LOG_PREFIX} scanned ${all.length} messages (sidebar hidden).`
+            );
+        }
+        console.log(
+            `${LOG_PREFIX} rebuildSidebar completed; total known items: ${seenKeys.size}`
+        );
     } catch (e) {
         console.error(`${LOG_PREFIX} rebuild error`, e);
     }
@@ -275,6 +335,7 @@ function setupObserverAndHandlers() {
             clearInterval(interval);
             console.log(`${LOG_PREFIX} chat root found — starting observer`);
             ensureToggleButton();
+
             // Click outside (close when clicking conversation)
             document.addEventListener("click", (ev) => {
                 const sidebar = document.getElementById("chatgpt-navigator");
@@ -296,16 +357,44 @@ function setupObserverAndHandlers() {
                 if (ev.key === "Escape") toggleSidebar(false);
             });
 
-            // initial build but keep collapsed
-            rebuildSidebar();
+            // initial silent scan (mark existing messages) — don't show UI yet
+            const initial = getAllMessages();
+            initial.forEach((m) => seenKeys.add(m.id));
+            console.log(
+                `${LOG_PREFIX} initial silent scan: ${initial.length} messages marked.`
+            );
 
-            // observe changes to the chat and refresh silently (no auto-open)
+            // observe changes to the chat and refresh silently (append only new ones)
             const observer = new MutationObserver(() => {
                 // debounce
                 if (observer._timeout) clearTimeout(observer._timeout);
                 observer._timeout = setTimeout(() => {
-                    rebuildSidebar();
-                }, 300);
+                    try {
+                        const newMessages = getNewMessages();
+                        if (newMessages && newMessages.length) {
+                            // Add them to seen set and append to sidebar if visible
+                            newMessages.forEach((m) => seenKeys.add(m.id));
+                            const sidebar =
+                                document.getElementById("chatgpt-navigator");
+                            if (sidebar && sidebar.style.display === "block") {
+                                updateSidebar(newMessages, { append: true });
+                                console.log(
+                                    `${LOG_PREFIX} appended ${newMessages.length} new items.`
+                                );
+                            } else {
+                                // Not visible — just update seenKeys and log
+                                console.log(
+                                    `${LOG_PREFIX} detected ${newMessages.length} new message(s) (sidebar hidden).`
+                                );
+                            }
+                        }
+                    } catch (err) {
+                        console.error(
+                            `${LOG_PREFIX} observer handler error`,
+                            err
+                        );
+                    }
+                }, 250);
             });
             observer.observe(chatRoot, { childList: true, subtree: true });
         } else if (attempts > 40) {
